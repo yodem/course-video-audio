@@ -1,0 +1,17 @@
+{
+  "name": "course-video-audio",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Download course lecture videos and extract audio. Reusable across courses.",
+  "scripts": {
+    "start": "node run.mjs",
+    "discover": "node run.mjs --step discover",
+    "download": "node run.mjs --step download",
+    "audio": "node run.mjs --step audio",
+    "upload": "node run.mjs --step upload",
+    "all": "node run.mjs --step all"
+  },
+  "dependencies": {
+    "playwright": "*"
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "_readme": "Copy to config.json and fill in. The tool is multi-course: list each course under `courses` with an ID (usually the Moodle course ID), the course URL, and optionally a NotebookLM notebook ID to reuse. Pick which one to run with --course <id>, or add a top-level `defaultCourse`. You can also run ad-hoc with --url / --notebook / --title.",
+
+  "_cookies_note": "Cookie auth is tried in this order: (1) cookiesFromBrowser (reads your live browser session via yt-dlp), then (2) the manual `cookies` array merged in as a fallback. Either alone works; both together is most robust. For the manual array, export from Chrome with the EditThisCookie extension and paste the JSON. Only MoodleSessionprod is strictly required.",
+  "cookiesFromBrowser": "chrome",
+  "cookies": [
+    {
+      "domain": "lemida.biu.ac.il",
+      "name": "MoodleSessionprod",
+      "value": "REPLACE_WITH_YOUR_SESSION_VALUE",
+      "path": "/",
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "unspecified"
+    }
+  ],
+
+  "_output_note": "Per-course artifacts live at <root>/<courseId>/{downloads,audio,manifests}/. Set an explicit root to keep every course's files isolated.",
+  "output": {
+    "root": "./out"
+  },
+
+  "ffmpeg": {
+    "codec": "libmp3lame",
+    "quality": 4
+  },
+
+  "_notebooklm_note": "Enable to auto-upload extracted MP3s to NotebookLM via the `nlm` CLI. Set `notebookId` per course to reuse a specific notebook; leave null and a new one will be created on first run (its ID is persisted to <root>/<courseId>/manifests/uploads.json).",
+  "notebooklm": {
+    "enabled": true,
+    "waitTimeoutSeconds": 1800
+  },
+
+  "defaultCourse": "999999",
+  "courses": {
+    "999999": {
+      "url": "https://lemida.biu.ac.il/course/view.php?id=999999",
+      "notebookId": null,
+      "title": "Example Course"
+    }
+  },
+
+  "_selectors_note": "Selectors are verified against lemida.biu.ac.il — other Moodle instances may need tweaks to run.mjs.",
+  "_selector_activities": "li.activity.modtype_videostream a[href]",
+  "_selector_title": "li.activity.modtype_videostream [data-activityname]",
+  "_selector_mp4": "source[type='video/mp4']"
+}
