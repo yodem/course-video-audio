@@ -64,7 +64,7 @@ nlm login
 
 ```bash
 cd ~
-git clone https://github.com/<YOUR-GITHUB-USERNAME>/course-video-audio.git
+git clone https://github.com/yodem/course-video-audio.git
 cd course-video-audio
 npm install
 npx playwright install chromium

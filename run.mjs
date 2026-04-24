@@ -21,8 +21,10 @@ import {
   createWriteStream,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readdirSync,
   renameSync,
+  rmSync,
   writeFileSync,
   readFileSync,
   unlinkSync,
@@ -123,12 +125,30 @@ function resolveOutputPaths(cfg, courseId) {
 
 // ─── Cookie helpers ───────────────────────────────────────────────────────────
 
+// Windows FILETIME epoch (1601-01-01) vs Unix epoch (1970-01-01), in seconds.
+// yt-dlp occasionally emits Chrome's raw FILETIME (microseconds since 1601-01-01)
+// in the expiry column, so we detect & convert. See MSDN: FILETIME structure.
+const WINDOWS_FILETIME_EPOCH_OFFSET_SECONDS = 11_644_473_600;
+const WINDOWS_FILETIME_MICROSECONDS_THRESHOLD = WINDOWS_FILETIME_EPOCH_OFFSET_SECONDS * 1_000_000;
+// Values beyond this are unambiguously milliseconds (> year 2970 in seconds).
+const MILLISECOND_EPOCH_THRESHOLD = 32_503_680_000;
+
+function hostnameFromUrl(u) {
+  try { return new URL(u).hostname; } catch { return null; }
+}
+
+/** Registrable domain (etld+1-ish) — last two labels. Good enough for Moodle hosts. */
+function baseDomain(host) {
+  if (!host) return null;
+  const parts = host.split('.');
+  return parts.length >= 2 ? parts.slice(-2).join('.') : host;
+}
+
 /**
  * Extract cookies from the live Chrome browser using yt-dlp.
- * Writes a Netscape cookies.txt to a temp file, parses it, returns Playwright cookie objects.
+ * Writes a Netscape cookies.txt to a private tmp directory, parses it, cleans up.
  */
-function extractCookiesFromBrowser(browser = 'chrome', domain = null) {
-  // Find yt-dlp
+function extractCookiesFromBrowser(browser = 'chrome', targetUrl = null) {
   let ytdlp = null;
   const home = process.env.HOME ?? '';
   for (const candidate of ['yt-dlp', `${home}/.pyenv/shims/yt-dlp`, '/opt/homebrew/bin/yt-dlp', '/usr/local/bin/yt-dlp']) {
@@ -136,28 +156,34 @@ function extractCookiesFromBrowser(browser = 'chrome', domain = null) {
   }
   if (!ytdlp) throw new Error('yt-dlp not found. Install with: brew install yt-dlp');
 
-  const tmpFile = join(os.tmpdir(), `cva-cookies-${Date.now()}.txt`);
-  log(`Extracting cookies from ${browser} via yt-dlp…`);
+  const url = targetUrl ?? 'https://lemida.biu.ac.il/';
+  const filterDomain = baseDomain(hostnameFromUrl(url));
+  if (!filterDomain) throw new Error(`Cannot derive cookie filter domain from URL: ${url}`);
 
-  // Use a known URL on the target domain so yt-dlp filters the right cookies
-  const targetUrl = domain ? `https://${domain}/` : 'https://lemida.biu.ac.il/';
+  // Private tmp dir — mkdtempSync creates with mode 0o700 on POSIX, so the cookie file
+  // is not world-readable. Wrapped in try/finally to guarantee cleanup on crash.
+  const tmpDir = mkdtempSync(join(os.tmpdir(), 'cva-cookies-'));
+  const tmpFile = join(tmpDir, 'cookies.txt');
+  log(`Extracting cookies from ${browser} via yt-dlp (filter: ${filterDomain})…`);
+
+  let lines;
   try {
-    spawnSync(
-      ytdlp,
-      ['--cookies-from-browser', browser, '--cookies', tmpFile, '--skip-download', targetUrl],
-      { stdio: ['ignore', 'ignore', 'ignore'] }
-    );
-  } catch (e) {
-    throw new Error(`yt-dlp cookie extraction failed: ${e.message}`);
+    try {
+      spawnSync(
+        ytdlp,
+        ['--cookies-from-browser', browser, '--cookies', tmpFile, '--skip-download', url],
+        { stdio: ['ignore', 'ignore', 'ignore'] }
+      );
+    } catch (e) {
+      throw new Error(`yt-dlp cookie extraction failed: ${e.message}`);
+    }
+    if (!existsSync(tmpFile)) throw new Error('yt-dlp did not produce a cookies file. Is the browser logged in to the target host?');
+    lines = readFileSync(tmpFile, 'utf8').split('\n');
+  } finally {
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 
-  if (!existsSync(tmpFile)) throw new Error('yt-dlp did not produce a cookies file. Is Chrome open and logged in?');
-
-  const lines = readFileSync(tmpFile, 'utf8').split('\n');
-  try { unlinkSync(tmpFile); } catch {}
-
-  // Parse Netscape cookies.txt format:
-  // domain  includeSubdomains  path  secure  expiry  name  value
+  // Parse Netscape cookies.txt: domain includeSubdomains path secure expiry name value
   const cookies = [];
   for (const line of lines) {
     if (line.startsWith('#') || !line.trim()) continue;
@@ -165,18 +191,15 @@ function extractCookiesFromBrowser(browser = 'chrome', domain = null) {
     if (parts.length < 7) continue;
     const [cookieDomain, , cookiePath, secureStr, expiryStr, name, value] = parts;
     if (!name || !value) continue;
-    // Filter to biu.ac.il domain
-    if (!cookieDomain.includes('biu.ac.il')) continue;
-    // Convert expiry to Unix seconds for Playwright.
-    // yt-dlp sometimes outputs Chrome's raw FILETIME (microseconds since 1601-01-01).
-    // Values > 11644473600000000 are FILETIME; convert to Unix seconds.
+    if (!cookieDomain.includes(filterDomain)) continue;
+
     let expires = -1;
     const rawExpiry = parseInt(expiryStr, 10);
     if (!isNaN(rawExpiry) && rawExpiry > 0) {
-      if (rawExpiry > 11644473600000000) {
-        expires = Math.floor(rawExpiry / 1000000) - 11644473600;
+      if (rawExpiry > WINDOWS_FILETIME_MICROSECONDS_THRESHOLD) {
+        expires = Math.floor(rawExpiry / 1_000_000) - WINDOWS_FILETIME_EPOCH_OFFSET_SECONDS;
         if (expires <= 0) expires = -1;
-      } else if (rawExpiry > 32503680000) {
+      } else if (rawExpiry > MILLISECOND_EPOCH_THRESHOLD) {
         expires = Math.floor(rawExpiry / 1000);
       } else {
         expires = rawExpiry;
@@ -190,18 +213,18 @@ function extractCookiesFromBrowser(browser = 'chrome', domain = null) {
       expires,
       httpOnly: false,
       secure: secureStr.trim().toUpperCase() === 'TRUE',
-      sameSite: 'None',
+      sameSite: 'Lax', // safe default; manual cookies override by name anyway
     });
   }
 
-  const session = cookies.find(c => c.name === 'MoodleSessionprod');
-  if (!session) {
+  const hasSession = cookies.some(c => c.name === 'MoodleSessionprod');
+  if (!hasSession) {
     throw new Error(
-      'MoodleSessionprod cookie not found in Chrome.\n' +
-      'Please make sure you are logged in to lemida.biu.ac.il in Chrome and retry.'
+      `MoodleSessionprod cookie not found in ${browser}.\n` +
+      `Please log in to ${filterDomain} in ${browser} and retry.`
     );
   }
-  log(`Got ${cookies.length} biu.ac.il cookie(s) including MoodleSessionprod.`);
+  log(`Got ${cookies.length} ${filterDomain} cookie(s) including MoodleSessionprod.`);
   return cookies;
 }
 
@@ -228,11 +251,11 @@ function mapManualCookies(list) {
   });
 }
 
-function getCookies(cfg) {
+function getCookies(cfg, courseUrl) {
   const manual = cfg.cookies && cfg.cookies.length > 0 ? mapManualCookies(cfg.cookies) : [];
   if (cfg.cookiesFromBrowser) {
     try {
-      const fromBrowser = extractCookiesFromBrowser(cfg.cookiesFromBrowser);
+      const fromBrowser = extractCookiesFromBrowser(cfg.cookiesFromBrowser, courseUrl);
       // Merge: **manual cookies win by name**. The user's pasted cookies are
       // authoritative (just re-logged in). Chrome's on-disk DB lags the live
       // session — yt-dlp can return a stale MoodleSessionprod value.
@@ -267,99 +290,98 @@ function log(msg) {
 // ─── Discovery ───────────────────────────────────────────────────────────────
 
 async function discover(cfg, paths, courseUrl, headed = false) {
-  const cookies = getCookies(cfg);
+  const cookies = getCookies(cfg, courseUrl);
 
   log('Launching browser…');
   const browser = await chromium.launch({ headless: !headed, slowMo: headed ? 100 : 0 });
-  const context = await browser.newContext();
-
-  if (cookies.length > 0) {
-    log(`Injecting ${cookies.length} cookie(s)…`);
-    await context.addCookies(cookies);
-  }
-
-  const page = await context.newPage();
-  log(`Navigating to ${courseUrl}`);
-  await page.goto(courseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-  const currentUrl = page.url();
-  if (currentUrl.includes('/login/') || currentUrl.includes('/enrol/')) {
-    if (!headed) {
-      await browser.close();
-      throw new Error(
-        'Redirected to login/enrol — session cookie is expired or missing.\n' +
-        (cfg.cookiesFromBrowser
-          ? `Make sure you are logged in to lemida.biu.ac.il in ${cfg.cookiesFromBrowser} and retry.`
-          : 'Set "cookiesFromBrowser": "chrome" in config.json, or paste fresh cookies.')
-      );
-    }
-    log('Login required — please log in in the browser window that opened (waiting up to 5 min)…');
-    // Poll until the browser has left the login/SSO pages (waitForURL chokes on ERR_ABORTED mid-SSO)
-    const deadline = Date.now() + 300_000;
-    while (Date.now() < deadline) {
-      await page.waitForTimeout(1500);
-      const u = page.url();
-      if (!u.includes('/login/') && !u.includes('/enrol/') && !u.includes('microsoftonline')) break;
-    }
-    if (page.url().includes('/login/') || page.url().includes('/enrol/') || page.url().includes('microsoftonline')) {
-      await browser.close();
-      throw new Error('Login timeout — 5 minutes elapsed without completing login.');
-    }
-    // navigate to course page after login
-    await page.goto(courseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  }
-
-  log('Scanning for video activities…');
-
-  const activityLinks = await page.evaluate(() => {
-    const items = document.querySelectorAll('li.activity.modtype_videostream');
-    return Array.from(items).map((li) => {
-      const a = li.querySelector('a[href]');
-      const nameEl = li.querySelector('[data-activityname]');
-      const title = (
-        nameEl?.getAttribute('data-activityname') ??
-        nameEl?.textContent?.trim() ??
-        a?.textContent?.trim() ??
-        a?.href ?? ''
-      ).replace(/\s+/g, ' ').trim();
-      return { title, href: a?.href ?? null };
-    }).filter(item => item.href);
-  });
-
-  log(`Found ${activityLinks.length} video activity link(s).`);
-
   const manifest = [];
+  try {
+    const context = await browser.newContext();
 
-  for (let i = 0; i < activityLinks.length; i++) {
-    const { title, href } = activityLinks[i];
-    const index = String(i + 1).padStart(3, '0');
-    log(`  [${index}/${activityLinks.length}] ${title}`);
-
-    try {
-      await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-      const mp4Url = await page.evaluate(() => {
-        const src = document.querySelector("source[type='video/mp4']");
-        return src?.src ?? src?.getAttribute('src') ?? null;
-      });
-
-      if (!mp4Url) {
-        log(`         [warn] No MP4 source found — skipping.`);
-        manifest.push({ index, title, activityUrl: href, mp4Url: null, filename: null, error: 'no_mp4_found' });
-        continue;
-      }
-
-      const moduleId = new URL(href).searchParams.get('id') ?? `x${i}`;
-      const filename = `${index}-${moduleId}-${slugify(title)}.mp4`;
-      log(`         → ${filename}`);
-      manifest.push({ index, title, activityUrl: href, mp4Url, filename });
-    } catch (err) {
-      log(`         [error] ${err.message}`);
-      manifest.push({ index, title, activityUrl: href, mp4Url: null, filename: null, error: err.message });
+    if (cookies.length > 0) {
+      log(`Injecting ${cookies.length} cookie(s)…`);
+      await context.addCookies(cookies);
     }
-  }
 
-  await browser.close();
+    const page = await context.newPage();
+    log(`Navigating to ${courseUrl}`);
+    await page.goto(courseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    const currentUrl = page.url();
+    if (currentUrl.includes('/login/') || currentUrl.includes('/enrol/')) {
+      if (!headed) {
+        throw new Error(
+          'Redirected to login/enrol — session cookie is expired or missing.\n' +
+          (cfg.cookiesFromBrowser
+            ? `Make sure you are logged in to ${hostnameFromUrl(courseUrl) ?? 'the course host'} in ${cfg.cookiesFromBrowser} and retry.`
+            : 'Set "cookiesFromBrowser": "chrome" in config.json, or paste fresh cookies.')
+        );
+      }
+      log('Login required — please log in in the browser window that opened (waiting up to 5 min)…');
+      // Poll until the browser has left the login/SSO pages (waitForURL chokes on ERR_ABORTED mid-SSO)
+      const deadline = Date.now() + 300_000;
+      while (Date.now() < deadline) {
+        await page.waitForTimeout(1500);
+        const u = page.url();
+        if (!u.includes('/login/') && !u.includes('/enrol/') && !u.includes('microsoftonline')) break;
+      }
+      if (page.url().includes('/login/') || page.url().includes('/enrol/') || page.url().includes('microsoftonline')) {
+        throw new Error('Login timeout — 5 minutes elapsed without completing login.');
+      }
+      await page.goto(courseUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    }
+
+    log('Scanning for video activities…');
+
+    const activityLinks = await page.evaluate(() => {
+      const items = document.querySelectorAll('li.activity.modtype_videostream');
+      return Array.from(items).map((li) => {
+        const a = li.querySelector('a[href]');
+        const nameEl = li.querySelector('[data-activityname]');
+        const title = (
+          nameEl?.getAttribute('data-activityname') ??
+          nameEl?.textContent?.trim() ??
+          a?.textContent?.trim() ??
+          a?.href ?? ''
+        ).replace(/\s+/g, ' ').trim();
+        return { title, href: a?.href ?? null };
+      }).filter(item => item.href);
+    });
+
+    log(`Found ${activityLinks.length} video activity link(s).`);
+
+    for (let i = 0; i < activityLinks.length; i++) {
+      const { title, href } = activityLinks[i];
+      const index = String(i + 1).padStart(3, '0');
+      log(`  [${index}/${activityLinks.length}] ${title}`);
+
+      try {
+        await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+        const mp4Url = await page.evaluate(() => {
+          const src = document.querySelector("source[type='video/mp4']");
+          return src?.src ?? src?.getAttribute('src') ?? null;
+        });
+
+        if (!mp4Url) {
+          log(`         [warn] No MP4 source found — skipping.`);
+          manifest.push({ index, title, activityUrl: href, mp4Url: null, filename: null, error: 'no_mp4_found' });
+          continue;
+        }
+
+        const moduleId = new URL(href).searchParams.get('id') ?? `x${i}`;
+        const filename = `${index}-${moduleId}-${slugify(title)}.mp4`;
+        log(`         → ${filename}`);
+        manifest.push({ index, title, activityUrl: href, mp4Url, filename });
+      } catch (err) {
+        log(`         [error] ${err.message}`);
+        manifest.push({ index, title, activityUrl: href, mp4Url: null, filename: null, error: err.message });
+      }
+    }
+  } finally {
+    // Resource cleanup on every path, success or error. Prevents Chromium zombie processes.
+    await browser.close().catch(() => {});
+  }
 
   ensureDir(paths.manifests);
   const courseId = new URL(courseUrl).searchParams.get('id') ?? slugify(courseUrl).slice(0, 20);
@@ -372,23 +394,50 @@ async function discover(cfg, paths, courseUrl, headed = false) {
 
 // ─── Download ─────────────────────────────────────────────────────────────────
 
-function downloadFile(url, destPath) {
+const MAX_REDIRECT_HOPS = 5;
+// Private/link-local ranges + loopback. Blocks SSRF via malicious redirect.
+const PRIVATE_IP_PATTERNS = [
+  /^127\./, /^10\./, /^192\.168\./,
+  /^172\.(1[6-9]|2\d|3[0-1])\./,
+  /^169\.254\./, /^::1$/, /^localhost$/i,
+  /^0\./, /^fc[0-9a-f]{2}:/i, /^fe80:/i,
+];
+
+function isSafeDownloadTarget(url) {
+  let u;
+  try { u = new URL(url); } catch { return false; }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return false;
+  if (PRIVATE_IP_PATTERNS.some(p => p.test(u.hostname))) return false;
+  return true;
+}
+
+function downloadFile(url, destPath, hops = 0) {
   return new Promise((resolve, reject) => {
     if (existsSync(destPath)) {
       log(`    [skip] Already exists: ${basename(destPath)}`);
       return resolve(destPath);
     }
+    if (hops > MAX_REDIRECT_HOPS) return reject(new Error(`Too many redirects (>${MAX_REDIRECT_HOPS}) for ${url}`));
+    if (!isSafeDownloadTarget(url)) return reject(new Error(`Refusing to download from unsafe URL (private/loopback/non-http): ${url}`));
+
     const proto = url.startsWith('https') ? https : http;
     const tmp = destPath + '.part';
     const file = createWriteStream(tmp);
+    let finished = false;
+
+    const cleanupPart = () => { try { if (existsSync(tmp)) unlinkSync(tmp); } catch {} };
+    const fail = (err) => { if (finished) return; finished = true; try { file.close(); } catch {} cleanupPart(); reject(err); };
+
     const req = proto.get(url, (res) => {
-      if (res.statusCode === 301 || res.statusCode === 302) {
-        file.close();
-        return downloadFile(res.headers.location, destPath).then(resolve).catch(reject);
+      if (res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307 || res.statusCode === 308) {
+        try { file.close(); } catch {}
+        cleanupPart();
+        const next = res.headers.location ?? '';
+        const absolute = next.startsWith('http') ? next : new URL(next, url).toString();
+        return downloadFile(absolute, destPath, hops + 1).then(resolve, reject);
       }
       if (res.statusCode !== 200 && res.statusCode !== 206) {
-        file.close();
-        return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+        return fail(new Error(`HTTP ${res.statusCode} for ${url}`));
       }
       const total = parseInt(res.headers['content-length'] ?? '0', 10);
       let received = 0;
@@ -403,13 +452,17 @@ function downloadFile(url, destPath) {
           }
         }
       });
+      res.on('error', fail);
       res.pipe(file);
       file.on('finish', () => {
+        if (finished) return;
+        finished = true;
         process.stdout.write('\n');
-        file.close(() => { renameSync(tmp, destPath); resolve(destPath); });
+        file.close(() => { try { renameSync(tmp, destPath); resolve(destPath); } catch (e) { cleanupPart(); reject(e); } });
       });
+      file.on('error', fail);
     });
-    req.on('error', reject);
+    req.on('error', fail);
   });
 }
 
@@ -517,14 +570,29 @@ function createNotebook(nlm, title) {
   if (result.status !== 0) {
     throw new Error(`nlm notebook create failed (exit ${result.status}): ${(result.stderr ?? '').slice(-400)}`);
   }
-  // Parsing stdout is fragile across nlm versions — authoritative path: list-by-title after create.
+  // Authoritative path: list-by-title. Dropping the old stdout-regex fallback entirely;
+  // it could silently bind to a wrong 20-char token from a version string or error text.
   const id = findNotebookIdByTitle(nlm, title);
   if (id) return id;
-  // Fallback: try to pull an ID-shaped token from the create output.
-  const out = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
-  const match = out.match(/\b[A-Za-z0-9_-]{20,}\b/);
-  if (match) return match[0];
-  throw new Error(`nlm notebook create succeeded but ID could not be resolved.\nOutput:\n${out}`);
+  throw new Error(
+    `nlm notebook create succeeded but no notebook with title "${title}" appeared in \`nlm notebook list\`.\n` +
+    `Run \`nlm notebook list\` manually, then re-run with --notebook <id> or set notebookId in config.`
+  );
+}
+
+/**
+ * Sanitise a title before passing it as a CLI argument. Even though spawnSync
+ * uses argv (no shell), a title that starts with `--` or contains newlines
+ * can be misinterpreted as a new flag by the receiving CLI, which is the
+ * classic argv-injection pattern. Strip leading dashes and control chars.
+ */
+function sanitiseCliTitle(title, fallback = 'Untitled') {
+  const cleaned = String(title ?? '')
+    .replace(/[\r\n\t\0]/g, ' ')
+    .replace(/^-+/, '')
+    .trim()
+    .slice(0, 200);
+  return cleaned.length > 0 ? cleaned : fallback;
 }
 
 async function uploadToNotebookLM(items, paths, cfg) {
@@ -547,7 +615,7 @@ async function uploadToNotebookLM(items, paths, cfg) {
   const state = loadUploadState(statePath);
   let notebookId = state.notebookId ?? nb.reuseNotebookId ?? null;
   if (!notebookId) {
-    const title = nb.notebookTitle ?? 'BIU Course Lectures';
+    const title = sanitiseCliTitle(nb.notebookTitle ?? 'BIU Course Lectures', 'BIU Course Lectures');
     log(`Creating NotebookLM notebook: "${title}"`);
     try {
       notebookId = createNotebook(nlm, title);
@@ -570,11 +638,12 @@ async function uploadToNotebookLM(items, paths, cfg) {
     const mp3 = item.localMp3;
     if (state.sources[mp3]) { log(`  [skip] Already uploaded: ${basename(mp3)}`); results.ok.push(item); continue; }
 
+    const cliTitle = sanitiseCliTitle(item.title || basename(mp3, '.mp3'), basename(mp3, '.mp3'));
     log(`Uploading [${item.index ?? '?'}] ${basename(mp3)}  (waiting up to ${waitTimeout}s)`);
     const args = [
       'source', 'add', notebookId,
       '--file', mp3,
-      '--title', item.title || basename(mp3, '.mp3'),
+      '--title', cliTitle,
       '--wait', '--wait-timeout', waitTimeout,
     ];
     const run = spawnSync(nlm, args, { stdio: 'inherit' });
