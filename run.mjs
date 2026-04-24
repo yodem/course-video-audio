@@ -276,7 +276,14 @@ function getCookies(cfg, courseUrl) {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function slugify(str) {
-  return str.toLowerCase().replace(/[^\w\s-]/g, '').trim().replace(/[\s_]+/g, '-').slice(0, 80);
+  // Keep Unicode letters/numbers (Hebrew, Arabic, CJK, etc.) so filenames are
+  // recognisable. \p{L}\p{N} requires the /u flag.
+  return String(str ?? '')
+    .replace(/[^\p{L}\p{N}\s-]/gu, '')
+    .trim()
+    .replace(/[\s_]+/g, '-')
+    .toLowerCase()
+    .slice(0, 80);
 }
 
 function ensureDir(dir) {
@@ -358,9 +365,16 @@ async function discover(cfg, paths, courseUrl, headed = false) {
       try {
         await page.goto(href, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        const mp4Url = await page.evaluate(() => {
+        // Grab both the MP4 source and the lecture's own page title (the h1 in
+        // .page-context-header). It's almost always a more descriptive/canonical
+        // name than the course-listing link text.
+        const { mp4Url, pageTitle } = await page.evaluate(() => {
           const src = document.querySelector("source[type='video/mp4']");
-          return src?.src ?? src?.getAttribute('src') ?? null;
+          const h1 = document.querySelector('.page-context-header .page-header-headings h1, .page-header-headings h1, h1.h2');
+          return {
+            mp4Url: src?.src ?? src?.getAttribute('src') ?? null,
+            pageTitle: (h1?.textContent ?? '').replace(/\s+/g, ' ').trim() || null,
+          };
         });
 
         if (!mp4Url) {
@@ -369,10 +383,12 @@ async function discover(cfg, paths, courseUrl, headed = false) {
           continue;
         }
 
+        const canonicalTitle = pageTitle || title;
         const moduleId = new URL(href).searchParams.get('id') ?? `x${i}`;
-        const filename = `${index}-${moduleId}-${slugify(title)}.mp4`;
+        const slug = slugify(canonicalTitle);
+        const filename = `${index}-${moduleId}${slug ? '-' + slug : ''}.mp4`;
         log(`         → ${filename}`);
-        manifest.push({ index, title, activityUrl: href, mp4Url, filename });
+        manifest.push({ index, title: canonicalTitle, linkTitle: title, activityUrl: href, mp4Url, filename });
       } catch (err) {
         log(`         [error] ${err.message}`);
         manifest.push({ index, title, activityUrl: href, mp4Url: null, filename: null, error: err.message });
