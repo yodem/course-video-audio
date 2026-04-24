@@ -28,9 +28,12 @@ You end up with a folder of MP3s **and** a NotebookLM notebook where every sourc
 
 ## What you need first
 
-Four free things. Don't panic — each is one command.
+Four free things. Don't panic — each is one command. Pick your OS below.
 
-### 1. Homebrew (Mac only — the installer for the other tools)
+<details open>
+<summary><strong>🍎 macOS</strong></summary>
+
+### 1. Homebrew (the installer for the other tools)
 
 Open Terminal (press ⌘-Space, type "Terminal", hit Enter) and paste:
 
@@ -38,11 +41,9 @@ Open Terminal (press ⌘-Space, type "Terminal", hit Enter) and paste:
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 ```
 
-Follow the prompts. When it finishes, you're done with this step.
+Follow the prompts.
 
 ### 2. Node.js, ffmpeg, yt-dlp, pipx
-
-In the same Terminal:
 
 ```bash
 brew install node ffmpeg yt-dlp pipx
@@ -69,6 +70,90 @@ cd course-video-audio
 npm install
 npx playwright install chromium
 ```
+
+</details>
+
+<details>
+<summary><strong>🪟 Windows 10 / 11</strong></summary>
+
+Everything below uses `winget`, which ships with Windows 10 (since 2021) and Windows 11. If `winget --version` fails, install "App Installer" from the Microsoft Store once and retry.
+
+Open **Windows Terminal** or **PowerShell** (press `Win`, type "PowerShell", Enter). **Do not** use the old Command Prompt (`cmd.exe`); a few commands below expect PowerShell.
+
+### 1. Node.js, Git, ffmpeg, yt-dlp, Python
+
+```powershell
+winget install --id OpenJS.NodeJS.LTS
+winget install --id Git.Git
+winget install --id Gyan.FFmpeg
+winget install --id yt-dlp.yt-dlp
+winget install --id Python.Python.3.12
+```
+
+Close and reopen PowerShell after this so the new commands land on your `PATH`.
+
+Verify:
+
+```powershell
+node --version ; git --version ; ffmpeg -version ; yt-dlp --version ; python --version
+```
+
+All five should print a version, not an error.
+
+### 2. pipx + the NotebookLM CLI (`nlm`)
+
+```powershell
+python -m pip install --user pipx
+python -m pipx ensurepath
+```
+
+Close and reopen PowerShell, then:
+
+```powershell
+pipx install nlm
+nlm login
+```
+
+`nlm login` opens a browser — sign in with your Google account for NotebookLM.
+
+### 3. This tool
+
+```powershell
+cd $HOME
+git clone https://github.com/yodem/course-video-audio.git
+cd course-video-audio
+npm install
+npx playwright install chromium
+```
+
+**Windows gotchas:**
+- If `npm install` fails on native build steps, install Visual Studio Build Tools: `winget install --id Microsoft.VisualStudio.2022.BuildTools`, then re-run `npm install`.
+- `"Close Chrome completely"` on Windows means right-clicking the Chrome icon in the system tray (bottom-right) → "Exit", or closing every Chrome window and every tab — the Chrome icon in the taskbar should no longer be present. Chrome flushes its on-disk cookie store on full shutdown; until it does, yt-dlp may read a stale `MoodleSessionprod`.
+- Paths like `./out/106813/audio` work in PowerShell exactly as shown — no need to translate to backslashes.
+
+</details>
+
+<details>
+<summary><strong>🐧 Linux (Ubuntu/Debian)</strong></summary>
+
+```bash
+sudo apt update
+sudo apt install -y nodejs npm ffmpeg yt-dlp python3-pip pipx git
+pipx ensurepath
+
+# reopen your terminal, then:
+pipx install nlm
+nlm login
+
+git clone https://github.com/yodem/course-video-audio.git
+cd course-video-audio
+npm install
+npx playwright install chromium
+```
+
+On Fedora/RHEL swap `apt` for `dnf`. Arch: `pacman -S nodejs npm ffmpeg yt-dlp python-pipx git`.
+
+</details>
 
 ---
 
